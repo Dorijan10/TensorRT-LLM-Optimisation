@@ -1560,9 +1560,8 @@ class WoqPerChannelFusedMoEMethodBase(FusedMoEMethodBase):
                 f"{name} to be a multiple of 64, got {num_rows} "
                 f"(tp_size={module.tp_size}). "
                 "preprocess_weights_for_mixed_gemm interleaves 64-row tiles. "
-                "For w2_weight this dimension is the per-partition intermediate "
-                "size, so a tensor-parallel size that keeps it 64-aligned is "
-                "required; for w3_w1_weight it is the hidden size.")
+                "For w2_weight this is the padded per-partition intermediate "
+                "size; for w3_w1_weight it is the hidden size.")
         if num_cols % 8 != 0:
             pack = cls.packed_elements_per_byte
             raise ValueError(
@@ -1574,6 +1573,22 @@ class WoqPerChannelFusedMoEMethodBase(FusedMoEMethodBase):
                 "w3_w1_weight is sized by the per-partition expanded "
                 "intermediate size and w2_weight by the hidden size.")
 
+    def _inter_pad(self,
+                   module: torch.nn.Module,
+                   size: int,
+                   name: str,
+                   packed: bool = False) -> int:
+        """Zero padding taking a sharded intermediate dim to the padded width."""
+        target = module._woq_inter_padded
+        if packed:
+            target //= self.packed_elements_per_byte
+        if size > target:
+            raise ValueError(
+                f"{self.quant_name} MoE expected at most {target} entries "
+                f"along the intermediate dim of {name}, got {size} "
+                f"(tp_size={module.tp_size}).")
+        return target - size
+
     def create_weights(self, module: torch.nn.Module) -> None:
         """Allocate the expert weights and full-width per-channel scales."""
         module.sm_version = get_sm_version()
@@ -1582,6 +1597,22 @@ class WoqPerChannelFusedMoEMethodBase(FusedMoEMethodBase):
 
         self._check_quant_mode(module)
 
+        pack = self.packed_elements_per_byte
+        inter = module.intermediate_size_per_partition
+        # A packed shard must hold whole storage bytes, or the weight shard
+        # and the logical scale shard disagree.
+        if pack > 1 and module.intermediate_size % (module.tp_size * pack):
+            raise ValueError(
+                f"{self.quant_name} MoE requires intermediate_size "
+                f"({module.intermediate_size}) to be a multiple of "
+                f"tp_size * {pack} (tp_size={module.tp_size}).")
+        # TP shards the intermediate dim; pad each shard with zero weights up
+        # to the 64-row tile of preprocess_weights_for_mixed_gemm.
+        inter_padded = (inter + 63) // 64 * 64
+        module._woq_inter_padded = inter_padded
+        expand_ratio = module.expand_intermediate_size_per_partition // inter
+        expand_padded = inter_padded * expand_ratio
+
         # The weight shape for per-channel weight-only differs from the original
         # shape, since the quantized weights have their own layout. The storage
         # container is int8; for INT4 each byte holds two values, so only the
@@ -1589,18 +1620,17 @@ class WoqPerChannelFusedMoEMethodBase(FusedMoEMethodBase):
         # expand_intermediate_size_per_partition (twice the per-partition
         # intermediate size for gated activations, once otherwise) keeps gated
         # and non-gated working without a hardcoded factor.
-        pack = self.packed_elements_per_byte
-        expand_inter = module.expand_intermediate_size_per_partition
         w3_w1_weight_shape = (module.expert_size_per_partition,
-                              module.hidden_size, expand_inter // pack)
-        w2_weight_shape = (module.expert_size_per_partition,
-                           module.intermediate_size_per_partition,
+                              module.hidden_size, expand_padded // pack)
+        w2_weight_shape = (module.expert_size_per_partition, inter_padded,
                            module.hidden_size // pack)
 
         # Scales stay at full logical width: one scale per output channel.
-        fc31_weight_scale = nn.Parameter(torch.empty(
-            module.expert_size_per_partition, expand_inter, dtype=module.dtype),
-                                         requires_grad=False)
+        fc31_weight_scale = nn.Parameter(
+            torch.empty(module.expert_size_per_partition,
+                        expand_padded,
+                        dtype=module.dtype),
+            requires_grad=False)
         module.register_parameter("fc31_weight_scale", fc31_weight_scale)
 
         fc2_weight_scale = nn.Parameter(torch.empty(
@@ -1634,6 +1664,14 @@ class WoqPerChannelFusedMoEMethodBase(FusedMoEMethodBase):
         w1_weight_shard = load_weight_shard(w1_weight, module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.COLUMN)
+        # Pad in storage bytes and before the preprocessor: a zero byte is
+        # zero weights only in the checkpoint encoding.
+        pad = self._inter_pad(module,
+                              w1_weight_shard.shape[0],
+                              "w1_weight",
+                              packed=True)
+        if pad:
+            w1_weight_shard = F.pad(w1_weight_shard, (0, 0, 0, pad))
 
         # w3 (gate_proj) is absent for non-gated MoE, e.g. Nemotron-H squared
         # ReLU. Only concatenate it when present; otherwise the single
@@ -1642,6 +1680,8 @@ class WoqPerChannelFusedMoEMethodBase(FusedMoEMethodBase):
             w3_weight_shard = load_weight_shard(w3_weight, module.tp_size,
                                                 module.tp_rank,
                                                 TensorParallelMode.COLUMN)
+            if pad:
+                w3_weight_shard = F.pad(w3_weight_shard, (0, 0, 0, pad))
             w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard],
                                          dim=0)
         else:
@@ -1683,6 +1723,9 @@ class WoqPerChannelFusedMoEMethodBase(FusedMoEMethodBase):
         w2_weight_shard = load_weight_shard(w2_weight, module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.ROW)
+        pad = self._inter_pad(module, w2_weight_shard.shape[1], "w2_weight")
+        if pad:
+            w2_weight_shard = F.pad(w2_weight_shard, (0, pad))
 
         self._check_quant_mode(module)
 
@@ -1707,19 +1750,27 @@ class WoqPerChannelFusedMoEMethodBase(FusedMoEMethodBase):
                 f"{self.quant_name} per-channel MoE does not support loading "
                 "scales from MoEWeightLoadingMode.FUSED_GATE_UP_PROJ "
                 "checkpoints.")
+
+        # 1.0 is inert: the padded weights are zero.
+        def _pad_scale(t):
+            p = self._inter_pad(module, t.shape[-1], "fc31_weight_scale")
+            return F.pad(t, (0, p), value=1.0) if p else t
+
         all_w1_scales = [
-            load_weight_shard(weights[f"{expert_id}.w1.weight_scale"],
-                              module.tp_size, module.tp_rank,
-                              TensorParallelMode.COLUMN)
+            _pad_scale(
+                load_weight_shard(weights[f"{expert_id}.w1.weight_scale"],
+                                  module.tp_size, module.tp_rank,
+                                  TensorParallelMode.COLUMN))
             for expert_id in module.initial_local_expert_ids
         ]
         has_w3_scales = all(f"{expert_id}.w3.weight_scale" in weights
                             for expert_id in module.initial_local_expert_ids)
         if module.is_gated_activation and has_w3_scales:
             all_w3_scales = [
-                load_weight_shard(weights[f"{expert_id}.w3.weight_scale"],
-                                  module.tp_size, module.tp_rank,
-                                  TensorParallelMode.COLUMN)
+                _pad_scale(
+                    load_weight_shard(weights[f"{expert_id}.w3.weight_scale"],
+                                      module.tp_size, module.tp_rank,
+                                      TensorParallelMode.COLUMN))
                 for expert_id in module.initial_local_expert_ids
             ]
             w3_w1_scales = torch.cat(

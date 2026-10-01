@@ -109,6 +109,7 @@ from tensorrt_llm._torch.moe.fused_moe.moe_resolution import (
 from tensorrt_llm._torch.moe.fused_moe.moe_scheduler import ExternalCommMoEScheduler
 from tensorrt_llm._torch.moe.fused_moe.quantization import (
     FusedMoEMethodBase,
+    INT8WoqPerChannelFusedMoEMethod,
     NVFP4FusedMoEMethod,
     NVFP4MarlinFusedMoEMethod,
     NVFP4TRTLLMGenFusedMoEBaseMethod,
@@ -116,6 +117,7 @@ from tensorrt_llm._torch.moe.fused_moe.quantization import (
     UnquantizedFusedMoEMethod,
     W4A8MXFP4MXFP8MegaMoEDeepGemmMethod,
     W4A16NVFP4CutlassFusedMoEMethod,
+    W4A16WoqPerChannelFusedMoEMethod,
 )
 from tensorrt_llm._torch.moe.fused_moe.trtllm_gen import (
     TrtllmTrtllmGenNvfp4Impl,
@@ -125,6 +127,7 @@ from tensorrt_llm._torch.utils import ActivationType, MxFp8QuantizedTensor, is_g
 from tensorrt_llm._utils import get_sm_version, is_sm_100f, mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
+from tensorrt_llm.quantization.functional import preprocess_weights_for_mixed_gemm
 
 logger = logging.getLogger(__name__)
 
@@ -1735,7 +1738,7 @@ def test_cutlass_w4a16_unaligned_rows_raise_diagnostic(
     several frames below the loader.  Left alone it surfaces as a bare
     ``AssertionError`` with no tensor name, no dimension and no tp_size.
 
-    The shapes chosen here are the ones that break W8A16 today:
+    The loaders now pad these shapes, which broke W8A16 before:
     intermediate_size 1856 at TP 2/4 and 2688 at TP 4.  W4A16 inherits the same
     restriction and is no worse, because ``rows_per_tile =
     128*8//BITS_PER_ELT_A`` is activation-driven and therefore 64 for both INT4
@@ -1818,6 +1821,151 @@ def test_cutlass_w4a16_unaligned_cols_raise_diagnostic(num_cols: int) -> None:
     assert "w3_w1_weight" in message
     assert str(num_cols) in message
     assert "tp_size=2" in message
+
+
+_WOQ_METHODS = {
+    QuantAlgo.W4A16: W4A16WoqPerChannelFusedMoEMethod,
+    QuantAlgo.W8A16: INT8WoqPerChannelFusedMoEMethod,
+}
+
+
+@pytest.mark.parametrize(
+    "activation_type",
+    [ActivationType.Swiglu, ActivationType.Relu2],
+    ids=["gated_swiglu", "nongated_relu2"],
+)
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.W4A16, QuantAlgo.W8A16], ids=["W4A16", "W8A16"])
+def test_cutlass_woq_padded_weight_shapes(
+    quant_algo: QuantAlgo, activation_type: ActivationType
+) -> None:
+    """An intermediate size of 200 is allocated padded to 256."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required to construct a Cutlass MoE backend")
+
+    num_experts, hidden_size, intermediate_size, padded = 4, 512, 200, 256
+    backend = create_test_backend(
+        backend_type=MoeBackendType.CUTLASS,
+        routing_method=RenormalizeMoeRoutingMethod(top_k=2),
+        num_experts=num_experts,
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(quant_algo=quant_algo),
+        mapping=Mapping(world_size=1, rank=0, tp_size=1),
+        activation_type=activation_type,
+    )
+    backend.create_weights()
+
+    pack = _WOQ_METHODS[quant_algo].packed_elements_per_byte
+    ratio = 2 if is_gated_activation(activation_type) else 1
+    assert tuple(backend.w3_w1_weight.shape) == (num_experts, hidden_size, padded * ratio // pack)
+    assert tuple(backend.w2_weight.shape) == (num_experts, padded, hidden_size // pack)
+    assert tuple(backend.fc31_weight_scale.shape) == (num_experts, padded * ratio)
+
+
+def _woq_load(quant_algo, ckpt, num_experts, hidden_size, shard, tp_size, tp_rank, gated):
+    """Run the three per-channel loaders on a stand-in module."""
+    method = _WOQ_METHODS[quant_algo]()
+    pack = method.packed_elements_per_byte
+    # Mirrors create_weights; test_cutlass_woq_padded_weight_shapes pins it.
+    padded = (shard + 63) // 64 * 64
+    expand = padded * (2 if gated else 1)
+    module = SimpleNamespace(
+        tp_size=tp_size,
+        tp_rank=tp_rank,
+        dtype=torch.bfloat16,
+        quant_config=QuantConfig(quant_algo=quant_algo),
+        preprocessor=preprocess_weights_for_mixed_gemm,
+        sm_version=80,
+        weight_loading_mode=MoEWeightLoadingMode.VANILLA,
+        initial_local_expert_ids=list(range(num_experts)),
+        is_gated_activation=gated,
+        _woq_inter_padded=padded,
+        fc31_weight_scale=torch.empty(num_experts, expand, dtype=torch.bfloat16),
+        fc2_weight_scale=torch.empty(num_experts, hidden_size, dtype=torch.bfloat16),
+    )
+    w3_w1 = torch.empty(num_experts, hidden_size, expand // pack, dtype=torch.int8)
+    w2 = torch.empty(num_experts, padded, hidden_size // pack, dtype=torch.int8)
+    for e in range(num_experts):
+        method.load_expert_w3_w1_weight(
+            module, ckpt[f"{e}.w1.weight"], ckpt.get(f"{e}.w3.weight"), w3_w1[e]
+        )
+        method.load_expert_w2_weight(module, ckpt[f"{e}.w2.weight"], w2[e])
+    method.load_quant_scales(module, ckpt)
+    return w3_w1, w2, module.fc31_weight_scale, module.fc2_weight_scale
+
+
+@pytest.mark.parametrize("gated", [True, False], ids=["gated", "nongated"])
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.W4A16, QuantAlgo.W8A16], ids=["W4A16", "W8A16"])
+def test_cutlass_woq_tp_shard_matches_presliced(quant_algo: QuantAlgo, gated: bool) -> None:
+    """Loading the full checkpoint at TP > 1 equals loading the pre-sliced shard at TP 1."""
+    num_experts, hidden_size, inter = 2, 2688, 1856
+    pack = _WOQ_METHODS[quant_algo].packed_elements_per_byte
+    gen = torch.Generator().manual_seed(0)
+
+    def rand_int8(*shape):
+        return torch.randint(-128, 128, shape, dtype=torch.int8, generator=gen)
+
+    names = ("w1", "w3") if gated else ("w1",)
+    ckpt = {}
+    for e in range(num_experts):
+        for n in names:
+            # INT4 is packed along the output dim, so w1/w3 rows are packed.
+            ckpt[f"{e}.{n}.weight"] = rand_int8(inter // pack, hidden_size)
+            ckpt[f"{e}.{n}.weight_scale"] = torch.rand(inter, generator=gen) + 0.5
+        ckpt[f"{e}.w2.weight"] = rand_int8(hidden_size // pack, inter)
+        ckpt[f"{e}.w2.weight_scale"] = torch.rand(hidden_size, generator=gen) + 0.5
+
+    for tp_size in (2, 4, 8):
+        shard = inter // tp_size
+        for tp_rank in range(tp_size):
+            rows = slice(tp_rank * shard // pack, (tp_rank + 1) * shard // pack)
+            cols = slice(tp_rank * shard, (tp_rank + 1) * shard)
+            sliced = {}
+            for key, value in ckpt.items():
+                if key.endswith(("w1.weight", "w3.weight")):
+                    sliced[key] = value[rows]
+                elif key.endswith("w2.weight_scale"):
+                    sliced[key] = value  # per hidden channel, not sharded
+                else:
+                    sliced[key] = value[..., cols]
+            full = _woq_load(
+                quant_algo, ckpt, num_experts, hidden_size, shard, tp_size, tp_rank, gated
+            )
+            ref = _woq_load(quant_algo, sliced, num_experts, hidden_size, shard, 1, 0, gated)
+            for got, want in zip(full, ref):
+                torch.testing.assert_close(got, want, rtol=0, atol=0)
+
+
+def test_cutlass_woq_w4a16_rejects_partial_byte_shard() -> None:
+    """W4A16 rejects a shard that is not whole bytes: 1864 / 8 = 233."""
+    if not torch.cuda.is_available():
+        pytest.skip("create_weights queries the SM version")
+
+    module = SimpleNamespace(
+        quant_config=QuantConfig(quant_algo=QuantAlgo.W4A16),
+        intermediate_size=1864,
+        tp_size=8,
+        intermediate_size_per_partition=233,
+        expand_intermediate_size_per_partition=466,
+    )
+    with pytest.raises(ValueError, match=r"tp_size=8"):
+        W4A16WoqPerChannelFusedMoEMethod().create_weights(module)
+
+
+@pytest.mark.parametrize("quant_algo", [QuantAlgo.W4A16, QuantAlgo.W8A16], ids=["W4A16", "W8A16"])
+def test_cutlass_woq_inter_pad_rejects_oversized_shard(quant_algo: QuantAlgo) -> None:
+    """A shard wider than the padded width raises instead of being truncated."""
+    method = _WOQ_METHODS[quant_algo]()
+    pack = method.packed_elements_per_byte
+    module = SimpleNamespace(_woq_inter_padded=256, tp_size=2)
+
+    assert method._inter_pad(module, 200, "w2_weight") == 56
+    assert method._inter_pad(module, 256 // pack, "w1_weight", packed=True) == 0
+    with pytest.raises(ValueError, match=r"w2_weight.*tp_size=2"):
+        method._inter_pad(module, 257, "w2_weight")
+    with pytest.raises(ValueError, match=r"w1_weight.*tp_size=2"):
+        method._inter_pad(module, 256 // pack + 1, "w1_weight", packed=True)
 
 
 @pytest.mark.gpu
@@ -2356,6 +2504,78 @@ def generate_element_wise_test_params() -> List:
 
 
 TEST_PARAMS += generate_element_wise_test_params()
+
+# Per-channel weight-only MoE pads a per-partition intermediate size that is
+# not a multiple of 64. Every MOE_MODEL_CONFIGS intermediate size is 64-aligned,
+# so cover the padding here at TP=1. 928, 464 and 232 are the Nemotron-H shards
+# (1856 at MoE TP 2, 4 and 8); all sizes are even, as INT4 packing requires.
+WOQ_NON_ALIGNED_MOE_MODEL_CONFIGS = [
+    MoeModelConfig(4, 2, 512, 200),
+    MoeModelConfig(4, 2, 2688, 928),
+    MoeModelConfig(4, 2, 2688, 464),
+    MoeModelConfig(4, 2, 2688, 232),
+]
+
+
+def generate_woq_non_aligned_test_params() -> List:
+    """W8A16 and W4A16 CUTLASS coverage for non-64-aligned intermediate sizes."""
+    params: List = []
+    generated = set()
+    # Gated pads w3 as well as w1 before the concatenation.
+    for activation_type in (ActivationType.Relu2, ActivationType.Swiglu):
+        for (
+            _,  # swiglu_alpha  (ignored)
+            _,  # swiglu_beta   (ignored)
+            _,  # swiglu_limit  (ignored)
+            model_config,
+            seq_len,
+            dtype,
+            backend_type,
+            quant_algo,
+            routing_method_cls,
+            skip_reason,
+            base_test_id,
+        ) in iter_base_test_configs(
+            [(1, 0, float("inf"))],  # swiglu parameters are irrelevant
+            WOQ_NON_ALIGNED_MOE_MODEL_CONFIGS,
+            SEQ_LENS_TO_TEST,
+            DTYPES_TO_TEST,
+            [MoeBackendType.CUTLASS],
+            [QuantAlgo.W8A16, QuantAlgo.W4A16],
+        ):
+            # The 128-alignment quick skip is the case under test; honour the rest.
+            if skip_reason and "Non-128-aligned" not in skip_reason:
+                continue
+            test_id = f"act={activation_type.name}-nonaligned-{base_test_id}"
+            gated = is_gated_activation(activation_type)
+            param_values = (
+                dtype,
+                backend_type,
+                quant_algo,
+                seq_len,
+                model_config,
+                routing_method_cls,
+                activation_type,
+                # None would be misread as gptoss-style SwiGLU when gated.
+                1 if gated else None,
+                0 if gated else None,
+                float("inf") if gated else None,
+                False,
+            )
+            params.append(create_test_param(param_values, test_id))
+            generated.add((quant_algo, activation_type))
+    # Fail loudly if a reworded skip message drops a quant or activation family.
+    expected = {
+        (quant_algo, activation_type)
+        for quant_algo in (QuantAlgo.W8A16, QuantAlgo.W4A16)
+        for activation_type in (ActivationType.Relu2, ActivationType.Swiglu)
+    }
+    if generated != expected:
+        raise ValueError(f"non-aligned weight-only coverage is incomplete: {generated}")
+    return params
+
+
+TEST_PARAMS += generate_woq_non_aligned_test_params()
 
 
 # =====================================================================
