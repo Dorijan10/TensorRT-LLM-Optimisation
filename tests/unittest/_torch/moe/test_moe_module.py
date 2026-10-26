@@ -1776,6 +1776,20 @@ MULTI_GPU_TEST_PARAMS += generate_multi_gpu_test_params(
     quant_algos=[QuantAlgo.W4A8_MXFP4_FP8],
     routing_methods=[RenormalizeMoeRoutingMethod],
 )
+# Per-channel weight-only MoE TP pads non-64-aligned shards (1408 / 4 = 352).
+# ALLGATHER runs without the NVLink fabric the COMM_METHODS a2a paths need.
+MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
+    backend_type=MoeBackendType.CUTLASS,
+    quant_algo=QuantAlgo.W8A16,
+    parallel_modes=["TTP"] if IS_CI_MODE else ["DTP", "TTP"],
+    comm_methods=["ALLGATHER"],
+)
+MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
+    backend_type=MoeBackendType.CUTLASS,
+    quant_algo=QuantAlgo.W4A16,
+    parallel_modes=["TTP"] if IS_CI_MODE else ["DTP", "TTP"],
+    comm_methods=["ALLGATHER"],
+)
 MULTI_GPU_TEST_PARAMS += _generate_focused_multi_gpu_test_params(
     backend_type=MoeBackendType.MEGAMOE_DEEPGEMM,
     quant_algo=QuantAlgo.W4A8_MXFP4_MXFP8,
