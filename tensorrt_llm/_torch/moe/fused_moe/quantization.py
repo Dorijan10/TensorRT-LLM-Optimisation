@@ -1581,9 +1581,8 @@ class WoqPerChannelFusedMoEMethodBase(FusedMoEMethodBase):
                 f"{name} to be a multiple of 64, got {num_rows} "
                 f"(tp_size={module.tp_size}). "
                 "preprocess_weights_for_mixed_gemm interleaves 64-row tiles. "
-                "For w2_weight this dimension is the per-partition intermediate "
-                "size, so a tensor-parallel size that keeps it 64-aligned is "
-                "required; for w3_w1_weight it is the hidden size.")
+                "For w2_weight this is the padded per-partition intermediate "
+                "size; for w3_w1_weight it is the hidden size.")
         if num_cols % 8 != 0:
             pack = cls.packed_elements_per_byte
             raise ValueError(
@@ -1628,10 +1627,9 @@ class WoqPerChannelFusedMoEMethodBase(FusedMoEMethodBase):
                 f"{self.quant_name} MoE requires intermediate_size "
                 f"({module.intermediate_size}) to be a multiple of "
                 f"tp_size * {pack} (tp_size={module.tp_size}).")
-        # TP shards the intermediate dim; pad each INT8 shard with zero weights
-        # up to the 64-row tile of preprocess_weights_for_mixed_gemm. INT4 is
-        # not padded, so an unaligned INT4 shard fails _validate_alignment.
-        inter_padded = (inter + 63) // 64 * 64 if pack == 1 else inter
+        # TP shards the intermediate dim; pad each shard with zero weights up
+        # to the 64-row tile of preprocess_weights_for_mixed_gemm.
+        inter_padded = (inter + 63) // 64 * 64
         module._woq_inter_padded = inter_padded
         expand_ratio = module.expand_intermediate_size_per_partition // inter
         expand_padded = inter_padded * expand_ratio
